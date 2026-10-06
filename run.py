@@ -1,7 +1,8 @@
 # MODULE IMPORTS
 
 # Flask modules
-from flask import Flask, render_template, request, url_for, request, redirect, abort
+from flask import Flask, render_template, request, url_for, redirect, abort
+from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from flask_talisman import Talisman
 from flask_pymongo import PyMongo
@@ -12,16 +13,15 @@ from flask_wtf.csrf import CSRFProtect
 from urllib.parse import urlparse, urljoin
 from datetime import datetime
 import configparser
-import json
-import sys
 import os
 
 # Local imports
 from user import User, Anonymous
 from message import Message
 from note import Note
-from email_utility import send_email, send_registration_email, send_message_email
-from verification import confirm_token
+from email_utility import send_registration_email, send_message_email
+from verification import TOKEN_TTL_SECONDS
+import activation_state
 
 
 # Create app
@@ -29,12 +29,19 @@ app = Flask(__name__)
 
 # Configuration
 config = configparser.ConfigParser()
-config.read('configuration.ini')
+config.read(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'configuration.ini'))
 default = config['DEFAULT']
-app.secret_key = default['SECRET_KEY']
-app.config['MONGO_DBNAME'] = os.environ.get('MONGO_DBNAME')
-app.config['MONGO_URI'] = os.environ.get('MONGODB_URI') #default['MONGO_URI']
+app.secret_key = os.environ.get('SECRET_KEY', default['SECRET_KEY'])
+app.config['MONGO_URI'] = os.environ.get(
+    'MONGODB_URI',
+    os.environ.get('MONGO_URI', 'mongodb://localhost:27017'))
+app.config['MONGO_DBNAME'] = os.environ.get(
+    'MONGO_DBNAME', default.get('DATABASE_NAME', 'sample'))
 app.config['PREFERRED_URL_SCHEME'] = "https"
+# Honour X-Forwarded-Proto/Host from the reverse proxy after our own
+# routing decisions; the confirmation base still defaults to ini.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 # Create Pymongo
 mongo = PyMongo(app)
@@ -52,7 +59,14 @@ csp = {
         'https://cdnjs.cloudflare.com'
     ]
 }
-talisman = Talisman(app, content_security_policy=csp)
+# Force HTTPS only where TLS is terminated upstream (Heroku); on a local
+# `python run.py` the dev server is plain HTTP, otherwise every page -
+# including the confirmation link - would 302 to an unusable https URL.
+talisman = Talisman(
+    app,
+    content_security_policy=csp,
+    force_https=(os.environ.get('APP_LOCATION') == 'heroku'),
+)
 
 # Create CSRF protect
 csrf = CSRFProtect()
@@ -63,6 +77,14 @@ login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.anonymous_user = Anonymous
 login_manager.login_view = "login"
+
+
+def issue_single_use_token(email, ttl_seconds=TOKEN_TTL_SECONDS):
+    """Generate a single-use token and persist its hash + expiry atomically."""
+    token = generate_confirmation_token(email)
+    stored = activation_state.issue_activation(
+        mongo.db.users, email, token, ttl_seconds=ttl_seconds)
+    return token if stored else None
 
 
 # ROUTES
@@ -79,7 +101,7 @@ def login():
     if request.method == 'GET':
         if current_user.is_authenticated:
             # Redirect to index if already authenticated
-            return redirect(url_for('/index'))
+            return redirect(url_for('index'))
         # Render login page
         return render_template('login.html', error=request.args.get("error"))
     # Retrieve user from database
@@ -93,12 +115,12 @@ def login():
             login_user(user)
 
             # Check for next argument (direct user to protected page they wanted)
-            next = request.args.get('next')
-            if not is_safe_url(next):
+            next_url = request.args.get('next')
+            if not is_safe_url(next_url):
                 return abort(400)
 
             # Go to profile page after login
-            return redirect(next or url_for('profile'))
+            return redirect(next_url or url_for('profile'))
 
     # Redirect to login page on error
     return redirect(url_for('login', error=1))
@@ -124,8 +146,9 @@ def register():
             logout_user()
             # Hash password
             hashpass = bc.generate_password_hash(password).decode('utf-8')
-            # Create user object (note password hash not stored in session)
+            # Create user object and stage the single-use activation token
             new_user = User(title, first_name, last_name, email)
+            token = new_user.issue_activation_token()
             # Create dictionary data to save to database
             user_data_to_save = new_user.dict()
             user_data_to_save['password'] = hashpass
@@ -133,11 +156,11 @@ def register():
             # Insert user record to database
             if users.insert_one(user_data_to_save):
                 login_user(new_user)
-                send_registration_email(new_user)
+                # The email carries the same token persisted on the account
+                send_registration_email(new_user, token=token)
                 return redirect(url_for('profile'))
-            else:
-                # Handle database error
-                return redirect(url_for('register', error=2))
+            # Handle database error
+            return redirect(url_for('register', error=2))
 
         # Handle duplicate email
         return redirect(url_for('register', error=1))
@@ -146,30 +169,40 @@ def register():
     return render_template('register.html', error=request.args.get("error"))
 
 
-# Confirm email
-@app.route('/confirm/<token>', methods=['GET'])
+# Confirm email - this route only assembles parameters. Every verdict comes
+# from activation_state.transition and the page only renders its copy, so no
+# path here can raise into a 500.
+@app.route('/confirm/<path:token>', methods=['GET'])
 def confirm_email(token):
-    logout_user()
     try:
-        email = confirm_token(token)
-        if email:
-            if mongo.db.users.update_one({"email": email}, {"$set": {"verified": True}}):
-                return render_template('confirm.html', success=True)
-    except:
-        return render_template('confirm.html', success=False)
-    else:
-        return render_template('confirm.html', success=False)
+        logout_user()
+    except Exception:
+        pass
+    # Even assembling the collection can fail (e.g. no database configured)
+    # - resolve defensively and let the state machine render DB_ERROR rather
+    # than ever surfacing a 500.
+    try:
+        users_collection = mongo.db.users if mongo.db is not None else None
+        state = activation_state.transition(users_collection, token)
+        context = activation_state.render_context(state)
+        return render_template('confirm.html', **context), 200
+    except Exception:
+        context = activation_state.render_context(activation_state.DB_ERROR)
+        return render_template('confirm.html', **context), 200
 
 
-# Verification email
+# Verification email (resend)
 @app.route('/verify', methods=['POST'])
 @login_required
 def send_verification_email():
-    if current_user.verified == False:
-        send_registration_email(current_user)
+    if not current_user.verified:
+        token = issue_single_use_token(current_user.email)
+        if token is None:
+            return ("A verification email could not be prepared. "
+                    "Please try again shortly.", 503)
+        send_registration_email(current_user, token=token)
         return "Verification email sent"
-    else:
-        return "Your email address is already verified"
+    return "Your email address is already verified"
 
 
 # Profile
@@ -190,8 +223,11 @@ def messages():
     inbox_messages = mongo.db.messages.find(
         {"to_id": current_user.id, "deleted": False}).sort("timestamp", -1)
     sent_messages = mongo.db.messages.find(
-        {"from_id": current_user.id, "deleted": False, "hidden_for_sender": False}).sort("timestamp", -1)
-    return render_template('messages.html', users=all_users, inbox_messages=inbox_messages, sent_messages=sent_messages)
+        {"from_id": current_user.id, "deleted": False,
+         "hidden_for_sender": False}).sort("timestamp", -1)
+    return render_template(
+        'messages.html', users=all_users, inbox_messages=inbox_messages,
+        sent_messages=sent_messages)
 
 
 # Logout
@@ -210,13 +246,10 @@ def logout():
 def add_note():
     title = request.form.get("title")
     body = request.form.get("body")
-    user_id = current_user.id
-    user_name = current_user.display_name()
-    note = Note(title, body, user_id, user_name)
+    note = Note(title, body, current_user.id, current_user.display_name())
     if mongo.db.notes.insert_one(note.dict()):
         return "Success! Note added: " + title
-    else:
-        return "Error! Could not add note"
+    return "Error! Could not add note"
 
 
 # Delete note
@@ -226,8 +259,7 @@ def delete_note():
     note_id = request.form.get("note_id")
     if mongo.db.notes.update_one({"id": note_id}, {"$set": {"deleted": True}}):
         return "Success! Note deleted"
-    else:
-        return "Error! Could not delete note"
+    return "Error! Could not delete note"
 
 
 # Send message
@@ -236,19 +268,16 @@ def delete_note():
 def send_message():
     title = request.form.get("title")
     body = request.form.get("body")
-    from_id = current_user.id
-    from_name = current_user.display_name()
     to_id = request.form.get("user")
     to_user_dict = mongo.db.users.find_one({"id": to_id})
     to_user = User.make_from_dict(to_user_dict)
-    to_name = to_user.display_name()
-    message = Message(title, body, from_id, from_name, to_id, to_name)
+    message = Message(title, body, current_user.id,
+                      current_user.display_name(), to_id, to_user.display_name())
     if mongo.db.messages.insert_one(message.dict()):
         send_message_email(from_user=current_user,
                            to_user=to_user, message=message)
-        return "Success! Message sent to " + to_name + ": " + title
-    else:
-        return "Error! Could not send message"
+        return "Success! Message sent to " + to_user.display_name() + ": " + title
+    return "Error! Could not send message"
 
 
 # Delete message
@@ -258,8 +287,7 @@ def delete_message():
     message_id = request.form.get("message_id")
     if mongo.db.messages.update_one({"id": message_id}, {"$set": {"deleted": True}}):
         return "Success! Message deleted"
-    else:
-        return "Error! Could not delete message"
+    return "Error! Could not delete message"
 
 
 # Hide sent message
@@ -269,8 +297,7 @@ def hide_sent_message():
     message_id = request.form.get("message_id")
     if mongo.db.messages.update_one({"id": message_id}, {"$set": {"hidden_for_sender": True}}):
         return "Success! Message hidden from sender"
-    else:
-        return "Error! Could not hide message"
+    return "Error! Could not hide message"
 
 
 # Change Name
@@ -281,10 +308,12 @@ def change_name():
     first_name = request.form['first_name'].strip()
     last_name = request.form['last_name'].strip()
 
-    if mongo.db.users.update_one({"email": current_user.email}, {"$set": {"title": title, "first_name": first_name, "last_name": last_name}}):
+    if mongo.db.users.update_one(
+            {"email": current_user.email},
+            {"$set": {"title": title, "first_name": first_name,
+                      "last_name": last_name}}):
         return "User name updated successfully"
-    else:
-        return "Error! Could not update user name"
+    return "Error! Could not update user name"
 
 
 # Delete Account
@@ -308,10 +337,12 @@ def delete_account():
         notes_deleted = True
 
     # Delete messages
-    if mongo.db.messages.delete_many({"$or": [{"from_id": user_id}, {"to_id": user_id}]}):
+    if mongo.db.messages.delete_many(
+            {"$or": [{"from_id": user_id}, {"to_id": user_id}]}):
         messages_deleted = True
 
-    return {"user_deleted": user_deleted, "notes_deleted": notes_deleted, "messages_deleted": messages_deleted}
+    return {"user_deleted": user_deleted, "notes_deleted": notes_deleted,
+            "messages_deleted": messages_deleted}
 
 
 # LOGIN MANAGER REQUIREMENTS
@@ -320,8 +351,7 @@ def delete_account():
 @login_manager.user_loader
 def load_user(userid):
     # Return user object or none
-    users = mongo.db.users
-    user = users.find_one({'id': userid}, {'_id': 0})
+    user = mongo.db.users.find_one({'id': userid}, {'_id': 0})
     if user:
         return User.make_from_dict(user)
     return None
@@ -335,9 +365,10 @@ def is_safe_url(target):
         ref_url.netloc == test_url.netloc
 
 
-# Heroku environment
-if os.environ.get('APP_LOCATION') == 'heroku':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-else:
-    app.run(host='localhost', port=8080, debug=True)
+# Heroku / local entry point
+if __name__ == '__main__':
+    if os.environ.get('APP_LOCATION') == 'heroku':
+        port = int(os.environ.get("PORT", 5000))
+        app.run(host="0.0.0.0", port=port)
+    else:
+        app.run(host='localhost', port=8080, debug=False)
